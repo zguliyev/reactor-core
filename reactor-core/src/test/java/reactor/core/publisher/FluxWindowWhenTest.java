@@ -19,9 +19,15 @@ package reactor.core.publisher;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.LongAdder;
 
 import org.assertj.core.api.Assertions;
+import org.assertj.core.api.Condition;
 import org.junit.Assert;
+import org.junit.Ignore;
 import org.junit.Test;
 import org.reactivestreams.Publisher;
 import org.reactivestreams.Subscription;
@@ -30,6 +36,8 @@ import reactor.core.Scannable;
 import reactor.test.StepVerifier;
 import reactor.test.subscriber.AssertSubscriber;
 import reactor.util.concurrent.Queues;
+import reactor.util.function.Tuple3;
+import reactor.util.function.Tuples;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -47,6 +55,80 @@ public class FluxWindowWhenTest {
 		         .get(index)).assertValues(values)
 		                     .assertComplete()
 		                     .assertNoError();
+	}
+
+	@Test
+	public void noWindowRetained_gh975() throws InterruptedException {
+		LongAdder created = new LongAdder();
+		LongAdder finalized = new LongAdder();
+		class Wrapper {
+
+			final int i;
+
+			Wrapper(int i) {
+				created.increment();
+				this.i = i;
+			}
+
+			@Override
+			public String toString() {
+				return "{i=" + i + '}';
+			}
+
+			@Override
+			protected void finalize() {
+				finalized.increment();
+			}
+		}
+
+		final CountDownLatch latch = new CountDownLatch(1);
+		final UnicastProcessor<Wrapper> processor = UnicastProcessor.create();
+
+		Flux<Integer> emitter = Flux.range(1, 800)
+		                            .delayElements(Duration.ofMillis(10))
+		                            .doOnNext(i -> processor.onNext(new Wrapper(i)))
+		                            .doOnComplete(processor::onComplete);
+
+		AtomicReference<FluxWindowWhen.WindowWhenMainSubscriber> startEndMain = new AtomicReference<>();
+		AtomicReference<List> windows = new AtomicReference<>();
+
+		Mono<List<Tuple3<Long, Integer, Long>>> buffers =
+				processor.window(Duration.ofMillis(1000), Duration.ofMillis(500))
+				         .doOnSubscribe(s -> {
+					         FluxWindowWhen.WindowWhenMainSubscriber sem =
+							         (FluxWindowWhen.WindowWhenMainSubscriber) s;
+					         startEndMain.set(sem);
+					         windows.set(sem.windows);
+				         })
+				         .flatMap(f -> f.take(2))
+				         .index()
+				         .doOnNext(it -> System.gc())
+				         //index, number of windows "in flight", finalized
+				         .map(t2 -> Tuples.of(t2.getT1(), windows.get().size(), finalized.longValue()))
+				         .doOnComplete(latch::countDown)
+				         .collectList();
+
+		emitter.subscribe();
+
+		List<Tuple3<Long, Integer, Long>> finalizeStats = buffers.block();
+
+		//at least 5 intermediate finalize
+		Condition<? super Tuple3<Long, Integer, Long>> hasFinalized = new Condition<>(
+				t3 -> t3.getT3() > 0, "has finalized");
+		assertThat(finalizeStats).areAtLeast(5, hasFinalized);
+
+		assertThat(finalizeStats).allMatch(t3 -> t3.getT2() <= 3, "max 3 windows in flight");
+
+		latch.await(10, TimeUnit.SECONDS);
+		System.gc();
+		Thread.sleep(500);
+
+		assertThat(windows.get())
+				.as("no window retained")
+				.isEmpty();
+		assertThat(finalized.longValue())
+				.as("final GC collects all")
+				.isEqualTo(created.longValue());
 	}
 
 	@Test
@@ -96,31 +178,32 @@ public class FluxWindowWhenTest {
 	public void normalStarterEnds() {
 		AssertSubscriber<Flux<Integer>> ts = AssertSubscriber.create();
 
-		DirectProcessor<Integer> sp1 = DirectProcessor.create();
-		DirectProcessor<Integer> sp2 = DirectProcessor.create();
-		DirectProcessor<Integer> sp3 = DirectProcessor.create();
-		DirectProcessor<Integer> sp4 = DirectProcessor.create();
+		DirectProcessor<Integer> source = DirectProcessor.create();
+		DirectProcessor<Integer> openSelector = DirectProcessor.create();
+		DirectProcessor<Integer> closeSelectorFor1 = DirectProcessor.create();
+		DirectProcessor<Integer> closeSelectorForOthers = DirectProcessor.create();
 
-		sp1.windowWhen(sp2, v -> v == 1 ? sp3 : sp4)
+		source.windowWhen(openSelector, v -> v == 1 ? closeSelectorFor1 : closeSelectorForOthers)
 		   .subscribe(ts);
 
-		sp1.onNext(1);
+		source.onNext(1);
 
-		sp2.onNext(1);
+		openSelector.onNext(1);
 
-		sp1.onNext(2);
+		source.onNext(2);
 
-		sp2.onNext(2);
+		openSelector.onNext(2);
 
-		sp1.onNext(3);
+		source.onNext(3);
 
-		sp3.onNext(1);
+		closeSelectorFor1.onNext(1);
 
-		sp1.onNext(4);
+		source.onNext(4);
 
-		sp4.onNext(1);
+		closeSelectorForOthers.onNext(1);
 
-		sp2.onComplete();
+		openSelector.onComplete();
+		source.onComplete(); //TODO evaluate, should the open completing cause the source to lose subscriber?
 
 		ts.assertValueCount(2)
 		  .assertNoError()
@@ -129,34 +212,34 @@ public class FluxWindowWhenTest {
 		expect(ts, 0, 2, 3);
 		expect(ts, 1, 3, 4);
 
-		Assert.assertFalse("sp1 has subscribers?", sp1.hasDownstreams());
-		Assert.assertFalse("sp2 has subscribers?", sp2.hasDownstreams());
-		Assert.assertFalse("sp3 has subscribers?", sp3.hasDownstreams());
-		Assert.assertFalse("sp4 has subscribers?", sp4.hasDownstreams());
+		Assert.assertFalse("openSelector has subscribers?", openSelector.hasDownstreams());
+		Assert.assertFalse("closeSelectorFor1 has subscribers?", closeSelectorFor1.hasDownstreams());
+		Assert.assertFalse("closeSelectorForOthers has subscribers?", closeSelectorForOthers.hasDownstreams());
+		Assert.assertFalse("source has subscribers?", source.hasDownstreams());
 	}
 
 	@Test
 	public void oneWindowOnly() {
 		AssertSubscriber<Flux<Integer>> ts = AssertSubscriber.create();
 
-		DirectProcessor<Integer> sp1 = DirectProcessor.create();
-		DirectProcessor<Integer> sp2 = DirectProcessor.create();
-		DirectProcessor<Integer> sp3 = DirectProcessor.create();
-		DirectProcessor<Integer> sp4 = DirectProcessor.create();
+		DirectProcessor<Integer> source = DirectProcessor.create();
+		DirectProcessor<Integer> openSelector = DirectProcessor.create();
+		DirectProcessor<Integer> closeSelectorFor1 = DirectProcessor.create();
+		DirectProcessor<Integer> closeSelectorOthers = DirectProcessor.create();
 
-		sp1.windowWhen(sp2, v -> v == 1 ? sp3 : sp4)
+		source.windowWhen(openSelector, v -> v == 1 ? closeSelectorFor1 : closeSelectorOthers)
 		   .subscribe(ts);
 
-		sp2.onNext(1);
-		sp2.onComplete();
+		openSelector.onNext(1);
 
-		sp1.onNext(1);
-		sp1.onNext(2);
-		sp1.onNext(3);
+		source.onNext(1);
+		source.onNext(2);
+		source.onNext(3);
 
-		sp3.onComplete();
+		closeSelectorFor1.onComplete();
 
-		sp1.onNext(4);
+		source.onNext(4);
+		source.onComplete();
 
 		ts.assertValueCount(1)
 		  .assertNoError()
@@ -164,10 +247,10 @@ public class FluxWindowWhenTest {
 
 		expect(ts, 0, 1, 2, 3);
 
-		Assert.assertFalse("sp1 has subscribers?", sp1.hasDownstreams());
-		Assert.assertFalse("sp2 has subscribers?", sp2.hasDownstreams());
-		Assert.assertFalse("sp3 has subscribers?", sp3.hasDownstreams());
-		Assert.assertFalse("sp4 has subscribers?", sp4.hasDownstreams());
+		Assert.assertFalse("source has subscribers?", source.hasDownstreams());
+		Assert.assertFalse("openSelector has subscribers?", openSelector.hasDownstreams());
+		Assert.assertFalse("closeSelectorFor1 has subscribers?", closeSelectorFor1.hasDownstreams());
+		Assert.assertFalse("closeSelectorOthers has subscribers?", closeSelectorOthers.hasDownstreams());
 	}
 
 
@@ -261,10 +344,12 @@ public class FluxWindowWhenTest {
 
 	@Test
     public void scanMainSubscriber() {
-        CoreSubscriber<Flux<Integer>> actual = new LambdaSubscriber<>(null, e -> {}, null, null);
-        FluxWindowWhen.WindowStartEndMainSubscriber<Integer, Integer, Integer> test =
-        		new FluxWindowWhen.WindowStartEndMainSubscriber<>(actual, Queues.one().get(),
-        		s -> Flux.just(s), Queues.unbounded());
+        CoreSubscriber<Flux<Integer>> actual = new LambdaSubscriber<>(null, e -> {}, null,
+		        sub -> sub.request(1));
+        FluxWindowWhen.WindowWhenMainSubscriber<Integer, Integer, Integer> test =
+        		new FluxWindowWhen.WindowWhenMainSubscriber<>(actual,
+				        Flux.never(), Flux::just,
+				        Queues.unbounded());
         Subscription parent = Operators.emptySubscription();
         test.onSubscribe(parent);
 
@@ -273,5 +358,33 @@ public class FluxWindowWhenTest {
 		Assertions.assertThat(test.scan(Scannable.Attr.TERMINATED)).isFalse();
 		test.onComplete();
 		Assertions.assertThat(test.scan(Scannable.Attr.TERMINATED)).isTrue();
+
+		Assertions.assertThat(test.scan(Scannable.Attr.CANCELLED)).isFalse();
+		test.cancel();
+		Assertions.assertThat(test.scan(Scannable.Attr.CANCELLED)).isTrue();
+
+		Assertions.assertThat(test.scan(Scannable.Attr.REQUESTED_FROM_DOWNSTREAM)).isEqualTo(1L);
+		test.request(123L);
+		Assertions.assertThat(test.scan(Scannable.Attr.REQUESTED_FROM_DOWNSTREAM)).isEqualTo(124L);
+    }
+
+	@Test
+    public void scanMainSubscriberError() {
+        CoreSubscriber<Flux<Integer>> actual = new LambdaSubscriber<>(null, e -> {}, null, null);
+        FluxWindowWhen.WindowWhenMainSubscriber<Integer, Integer, Integer> test =
+        		new FluxWindowWhen.WindowWhenMainSubscriber<>(actual,
+				        Flux.never(), Flux::just,
+				        Queues.unbounded());
+        Subscription parent = Operators.emptySubscription();
+        test.onSubscribe(parent);
+
+		Assertions.assertThat(test.scan(Scannable.Attr.TERMINATED)).isFalse();
+		Assertions.assertThat(test.scan(Scannable.Attr.ERROR)).isNull();
+
+		test.onError(new IllegalStateException("boom"));
+		Assertions.assertThat(test.scan(Scannable.Attr.TERMINATED)).isTrue();
+		Assertions.assertThat(test.scan(Scannable.Attr.ERROR))
+		          .isNotNull()
+		          .hasMessage("boom");
     }
 }
